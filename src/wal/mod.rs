@@ -6,3 +6,4 @@ pub mod recovery;
 
 pub use log_record::{LogRecord, LogRecordType, Lsn, TxnId};
 pub use log_manager::LogManager;
+pub use recovery::{RecoveryManager, RecoveryAction};
