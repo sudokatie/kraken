@@ -47,7 +47,6 @@ impl Parser {
 
     /// Advance to next token.
     fn advance(&mut self) -> &Token {
-        let token = self.current().clone();
         if self.pos < self.tokens.len() {
             self.pos += 1;
         }

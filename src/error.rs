@@ -32,6 +32,12 @@ pub enum Error {
     #[error("Unknown table: {0}")]
     UnknownTable(String),
 
+    #[error("Table already exists: {0}")]
+    TableExists(String),
+
+    #[error("Table not found: {0}")]
+    TableNotFound(String),
+
     #[error("Unknown column: {0}")]
     UnknownColumn(String),
 
