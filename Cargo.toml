@@ -1,0 +1,34 @@
+[package]
+name = "kraken"
+version = "0.1.0"
+edition = "2024"
+authors = ["Katie"]
+description = "A distributed SQL database"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/sudokatie/kraken"
+keywords = ["database", "sql", "distributed", "raft"]
+categories = ["database"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+crc32fast = "1"
+clap = { version = "4", features = ["derive"] }
+rustyline = "14"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "kraken"
+path = "src/main.rs"
+
+[lib]
+name = "kraken"
+path = "src/lib.rs"
