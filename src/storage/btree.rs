@@ -3,7 +3,7 @@
 //! A B+ tree for indexing with all values in leaf nodes.
 
 use crate::Result;
-use super::page::{Page, PageId, PageType, PAGE_SIZE};
+use super::page::{PageId, PageType, PAGE_SIZE};
 use super::buffer_pool::BufferPool;
 
 /// Maximum keys per node (branching factor).
@@ -116,8 +116,11 @@ impl BTreeNode {
     }
 
     /// Find child index for a key in an internal node.
+    /// In B+ tree: keys[i] is separator, go to children[i] if key < keys[i],
+    /// otherwise continue to the right.
     pub fn find_child(&self, key: Key) -> usize {
-        self.find_key_position(key)
+        // Find first key > target, then follow child at that index
+        self.keys.iter().position(|&k| k > key).unwrap_or(self.key_count)
     }
 
     /// Delete a key from a leaf node.
@@ -278,16 +281,197 @@ impl BTree {
                 // Insert into leaf
                 node.insert_leaf(key, value)?;
 
-                // Write back
-                let page = pool.fetch_page_mut(leaf_id)?;
-                let data = node.serialize();
-                page.data[..data.len()].copy_from_slice(&data);
-                page.dirty = true;
+                // Check if split needed
+                if node.is_full() {
+                    // Write the updated node first
+                    let page = pool.fetch_page_mut(leaf_id)?;
+                    let data = node.serialize();
+                    page.data[..data.len()].copy_from_slice(&data);
+                    page.dirty = true;
 
-                // TODO: Handle splits when node is full
+                    // Split upward
+                    self.split_node(pool, leaf_id)?;
+                } else {
+                    // Write back
+                    let page = pool.fetch_page_mut(leaf_id)?;
+                    let data = node.serialize();
+                    page.data[..data.len()].copy_from_slice(&data);
+                    page.dirty = true;
+                }
+
                 Ok(())
             }
         }
+    }
+
+    /// Split a full node and propagate up.
+    fn split_node(&mut self, pool: &mut BufferPool, node_id: PageId) -> Result<()> {
+        let page = pool.fetch_page(node_id)?;
+        let node = BTreeNode::deserialize(node_id, &page.data)?;
+
+        if !node.is_full() {
+            return Ok(());
+        }
+
+        let mid = node.key_count / 2;
+
+        if node.is_leaf {
+            // Create new leaf with right half
+            let new_page_id = pool.new_page(PageType::BTreeLeaf)?;
+            let mut new_node = BTreeNode::new_leaf(new_page_id);
+            new_node.keys = node.keys[mid..].to_vec();
+            new_node.children = node.children[mid..].to_vec();
+            new_node.key_count = node.key_count - mid;
+            new_node.next_leaf = node.next_leaf;
+            new_node.parent = node.parent;
+
+            // Update old node (left half)
+            let mut left_node = node.clone();
+            left_node.keys.truncate(mid);
+            left_node.children.truncate(mid);
+            left_node.key_count = mid;
+            left_node.next_leaf = Some(new_page_id);
+
+            // Key to promote
+            let promote_key = new_node.keys[0];
+
+            // Write both nodes
+            let page = pool.fetch_page_mut(node_id)?;
+            let data = left_node.serialize();
+            page.data[..data.len()].copy_from_slice(&data);
+            page.dirty = true;
+
+            let page = pool.fetch_page_mut(new_page_id)?;
+            let data = new_node.serialize();
+            page.data[..data.len()].copy_from_slice(&data);
+            page.dirty = true;
+
+            // Insert into parent
+            self.insert_into_parent(pool, node_id, promote_key, new_page_id)?;
+        } else {
+            // Internal node split
+            let new_page_id = pool.new_page(PageType::BTreeInternal)?;
+            let mut new_node = BTreeNode::new_internal(new_page_id);
+            new_node.keys = node.keys[mid + 1..].to_vec();
+            new_node.children = node.children[mid + 1..].to_vec();
+            new_node.key_count = node.key_count - mid - 1;
+            new_node.parent = node.parent;
+
+            // Key to promote (the middle key)
+            let promote_key = node.keys[mid];
+
+            // Update old node (left half)
+            let mut left_node = node.clone();
+            left_node.keys.truncate(mid);
+            left_node.children.truncate(mid + 1);
+            left_node.key_count = mid;
+
+            // Update parent pointers in new node's children
+            for &child_id in &new_node.children {
+                let child_page = pool.fetch_page(child_id as PageId)?;
+                let mut child = BTreeNode::deserialize(child_id as PageId, &child_page.data)?;
+                child.parent = Some(new_page_id);
+                let child_page = pool.fetch_page_mut(child_id as PageId)?;
+                let data = child.serialize();
+                child_page.data[..data.len()].copy_from_slice(&data);
+                child_page.dirty = true;
+            }
+
+            // Write both nodes
+            let page = pool.fetch_page_mut(node_id)?;
+            let data = left_node.serialize();
+            page.data[..data.len()].copy_from_slice(&data);
+            page.dirty = true;
+
+            let page = pool.fetch_page_mut(new_page_id)?;
+            let data = new_node.serialize();
+            page.data[..data.len()].copy_from_slice(&data);
+            page.dirty = true;
+
+            // Insert into parent
+            self.insert_into_parent(pool, node_id, promote_key, new_page_id)?;
+        }
+
+        Ok(())
+    }
+
+    /// Insert a key and right child into parent after split.
+    fn insert_into_parent(
+        &mut self,
+        pool: &mut BufferPool,
+        left_id: PageId,
+        key: Key,
+        right_id: PageId,
+    ) -> Result<()> {
+        let page = pool.fetch_page(left_id)?;
+        let left_node = BTreeNode::deserialize(left_id, &page.data)?;
+
+        match left_node.parent {
+            None => {
+                // Create new root
+                let new_root_id = pool.new_page(PageType::BTreeInternal)?;
+                let mut new_root = BTreeNode::new_internal(new_root_id);
+                new_root.keys.push(key);
+                new_root.children.push(left_id as u64);
+                new_root.children.push(right_id as u64);
+                new_root.key_count = 1;
+
+                // Write new root
+                let page = pool.fetch_page_mut(new_root_id)?;
+                let data = new_root.serialize();
+                page.data[..data.len()].copy_from_slice(&data);
+                page.dirty = true;
+
+                // Update children's parent pointers
+                self.update_parent(pool, left_id, new_root_id)?;
+                self.update_parent(pool, right_id, new_root_id)?;
+
+                self.root = Some(new_root_id);
+                Ok(())
+            }
+            Some(parent_id) => {
+                // Insert into existing parent
+                let page = pool.fetch_page(parent_id)?;
+                let mut parent = BTreeNode::deserialize(parent_id, &page.data)?;
+
+                let pos = parent.find_key_position(key);
+                parent.keys.insert(pos, key);
+                parent.children.insert(pos + 1, right_id as u64);
+                parent.key_count += 1;
+
+                // Update right child's parent
+                self.update_parent(pool, right_id, parent_id)?;
+
+                // Check if parent needs split
+                if parent.is_full() {
+                    let page = pool.fetch_page_mut(parent_id)?;
+                    let data = parent.serialize();
+                    page.data[..data.len()].copy_from_slice(&data);
+                    page.dirty = true;
+
+                    self.split_node(pool, parent_id)
+                } else {
+                    let page = pool.fetch_page_mut(parent_id)?;
+                    let data = parent.serialize();
+                    page.data[..data.len()].copy_from_slice(&data);
+                    page.dirty = true;
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// Update a node's parent pointer.
+    fn update_parent(&self, pool: &mut BufferPool, node_id: PageId, parent_id: PageId) -> Result<()> {
+        let page = pool.fetch_page(node_id)?;
+        let mut node = BTreeNode::deserialize(node_id, &page.data)?;
+        node.parent = Some(parent_id);
+
+        let page = pool.fetch_page_mut(node_id)?;
+        let data = node.serialize();
+        page.data[..data.len()].copy_from_slice(&data);
+        page.dirty = true;
+        Ok(())
     }
 
     /// Search for a key.
@@ -320,13 +504,285 @@ impl BTree {
                     let data = node.serialize();
                     page.data[..data.len()].copy_from_slice(&data);
                     page.dirty = true;
-                }
 
-                // TODO: Handle underflow
+                    // Handle underflow if not root
+                    if node.is_underfull() && node.parent.is_some() {
+                        self.handle_underflow(pool, leaf_id)?;
+                    }
+
+                    // Handle empty root
+                    if self.root == Some(leaf_id) && node.key_count == 0 {
+                        self.root = None;
+                    }
+                }
 
                 Ok(result)
             }
         }
+    }
+
+    /// Handle underflow after deletion by redistributing or merging.
+    fn handle_underflow(&mut self, pool: &mut BufferPool, node_id: PageId) -> Result<()> {
+        let page = pool.fetch_page(node_id)?;
+        let node = BTreeNode::deserialize(node_id, &page.data)?;
+
+        if !node.is_underfull() || node.parent.is_none() {
+            return Ok(());
+        }
+
+        let parent_id = node.parent.unwrap();
+        let page = pool.fetch_page(parent_id)?;
+        let parent = BTreeNode::deserialize(parent_id, &page.data)?;
+
+        // Find our position in parent
+        let pos = parent.children.iter()
+            .position(|&c| c == node_id as u64)
+            .ok_or_else(|| crate::Error::Internal("node not found in parent".into()))?;
+
+        // Try to borrow from left sibling
+        if pos > 0 {
+            let left_id = parent.children[pos - 1] as PageId;
+            if self.try_redistribute_from_left(pool, parent_id, pos, left_id, node_id)? {
+                return Ok(());
+            }
+        }
+
+        // Try to borrow from right sibling
+        if pos < parent.key_count {
+            let right_id = parent.children[pos + 1] as PageId;
+            if self.try_redistribute_from_right(pool, parent_id, pos, node_id, right_id)? {
+                return Ok(());
+            }
+        }
+
+        // Must merge
+        if pos > 0 {
+            // Merge with left sibling
+            let left_id = parent.children[pos - 1] as PageId;
+            self.merge_nodes(pool, parent_id, pos - 1, left_id, node_id)?;
+        } else {
+            // Merge with right sibling
+            let right_id = parent.children[pos + 1] as PageId;
+            self.merge_nodes(pool, parent_id, pos, node_id, right_id)?;
+        }
+
+        Ok(())
+    }
+
+    /// Try to redistribute keys from left sibling.
+    fn try_redistribute_from_left(
+        &self,
+        pool: &mut BufferPool,
+        parent_id: PageId,
+        key_idx: usize,
+        left_id: PageId,
+        right_id: PageId,
+    ) -> Result<bool> {
+        let page = pool.fetch_page(left_id)?;
+        let left = BTreeNode::deserialize(left_id, &page.data)?;
+
+        // Can't borrow if left would become underfull
+        if left.key_count <= MIN_KEYS {
+            return Ok(false);
+        }
+
+        let page = pool.fetch_page(right_id)?;
+        let mut right = BTreeNode::deserialize(right_id, &page.data)?;
+
+        let page = pool.fetch_page(parent_id)?;
+        let mut parent = BTreeNode::deserialize(parent_id, &page.data)?;
+
+        let mut left = left;
+
+        if left.is_leaf {
+            // Move last key from left to front of right
+            let move_key = left.keys.pop().unwrap();
+            let move_val = left.children.pop().unwrap();
+            left.key_count -= 1;
+
+            right.keys.insert(0, move_key);
+            right.children.insert(0, move_val);
+            right.key_count += 1;
+
+            // Update parent key
+            parent.keys[key_idx - 1] = right.keys[0];
+        } else {
+            // Internal node redistribution
+            let parent_key = parent.keys[key_idx - 1];
+            let move_child = left.children.pop().unwrap();
+            let move_key = left.keys.pop().unwrap();
+            left.key_count -= 1;
+
+            right.keys.insert(0, parent_key);
+            right.children.insert(0, move_child);
+            right.key_count += 1;
+
+            parent.keys[key_idx - 1] = move_key;
+
+            // Update moved child's parent
+            self.update_parent(pool, move_child as PageId, right_id)?;
+        }
+
+        // Write all nodes back
+        let page = pool.fetch_page_mut(left_id)?;
+        let data = left.serialize();
+        page.data[..data.len()].copy_from_slice(&data);
+        page.dirty = true;
+
+        let page = pool.fetch_page_mut(right_id)?;
+        let data = right.serialize();
+        page.data[..data.len()].copy_from_slice(&data);
+        page.dirty = true;
+
+        let page = pool.fetch_page_mut(parent_id)?;
+        let data = parent.serialize();
+        page.data[..data.len()].copy_from_slice(&data);
+        page.dirty = true;
+
+        Ok(true)
+    }
+
+    /// Try to redistribute keys from right sibling.
+    fn try_redistribute_from_right(
+        &self,
+        pool: &mut BufferPool,
+        parent_id: PageId,
+        key_idx: usize,
+        left_id: PageId,
+        right_id: PageId,
+    ) -> Result<bool> {
+        let page = pool.fetch_page(right_id)?;
+        let right = BTreeNode::deserialize(right_id, &page.data)?;
+
+        // Can't borrow if right would become underfull
+        if right.key_count <= MIN_KEYS {
+            return Ok(false);
+        }
+
+        let page = pool.fetch_page(left_id)?;
+        let mut left = BTreeNode::deserialize(left_id, &page.data)?;
+
+        let page = pool.fetch_page(parent_id)?;
+        let mut parent = BTreeNode::deserialize(parent_id, &page.data)?;
+
+        let mut right = right;
+
+        if left.is_leaf {
+            // Move first key from right to end of left
+            let move_key = right.keys.remove(0);
+            let move_val = right.children.remove(0);
+            right.key_count -= 1;
+
+            left.keys.push(move_key);
+            left.children.push(move_val);
+            left.key_count += 1;
+
+            // Update parent key
+            parent.keys[key_idx] = right.keys[0];
+        } else {
+            // Internal node redistribution
+            let parent_key = parent.keys[key_idx];
+            let move_child = right.children.remove(0);
+            let move_key = right.keys.remove(0);
+            right.key_count -= 1;
+
+            left.keys.push(parent_key);
+            left.children.push(move_child);
+            left.key_count += 1;
+
+            parent.keys[key_idx] = move_key;
+
+            // Update moved child's parent
+            self.update_parent(pool, move_child as PageId, left_id)?;
+        }
+
+        // Write all nodes back
+        let page = pool.fetch_page_mut(left_id)?;
+        let data = left.serialize();
+        page.data[..data.len()].copy_from_slice(&data);
+        page.dirty = true;
+
+        let page = pool.fetch_page_mut(right_id)?;
+        let data = right.serialize();
+        page.data[..data.len()].copy_from_slice(&data);
+        page.dirty = true;
+
+        let page = pool.fetch_page_mut(parent_id)?;
+        let data = parent.serialize();
+        page.data[..data.len()].copy_from_slice(&data);
+        page.dirty = true;
+
+        Ok(true)
+    }
+
+    /// Merge two sibling nodes.
+    fn merge_nodes(
+        &mut self,
+        pool: &mut BufferPool,
+        parent_id: PageId,
+        key_idx: usize,
+        left_id: PageId,
+        right_id: PageId,
+    ) -> Result<()> {
+        let page = pool.fetch_page(left_id)?;
+        let mut left = BTreeNode::deserialize(left_id, &page.data)?;
+
+        let page = pool.fetch_page(right_id)?;
+        let right = BTreeNode::deserialize(right_id, &page.data)?;
+
+        let page = pool.fetch_page(parent_id)?;
+        let mut parent = BTreeNode::deserialize(parent_id, &page.data)?;
+
+        if left.is_leaf {
+            // Merge leaf nodes: append right to left
+            left.keys.extend(right.keys.iter());
+            left.children.extend(right.children.iter());
+            left.key_count += right.key_count;
+            left.next_leaf = right.next_leaf;
+        } else {
+            // Merge internal nodes: include separator key from parent
+            left.keys.push(parent.keys[key_idx]);
+            left.keys.extend(right.keys.iter());
+            left.children.extend(right.children.iter());
+            left.key_count += 1 + right.key_count;
+
+            // Update parent pointers for merged children
+            for &child_id in &right.children {
+                self.update_parent(pool, child_id as PageId, left_id)?;
+            }
+        }
+
+        // Write merged node
+        let page = pool.fetch_page_mut(left_id)?;
+        let data = left.serialize();
+        page.data[..data.len()].copy_from_slice(&data);
+        page.dirty = true;
+
+        // Remove key and right child from parent
+        parent.keys.remove(key_idx);
+        parent.children.remove(key_idx + 1);
+        parent.key_count -= 1;
+
+        // Write parent
+        let page = pool.fetch_page_mut(parent_id)?;
+        let data = parent.serialize();
+        page.data[..data.len()].copy_from_slice(&data);
+        page.dirty = true;
+
+        // Handle parent underflow or empty root
+        if Some(parent_id) == self.root && parent.key_count == 0 {
+            // Root became empty, left child is new root
+            self.root = Some(left_id);
+            left.parent = None;
+            let page = pool.fetch_page_mut(left_id)?;
+            let data = left.serialize();
+            page.data[..data.len()].copy_from_slice(&data);
+            page.dirty = true;
+        } else if parent.is_underfull() && parent.parent.is_some() {
+            self.handle_underflow(pool, parent_id)?;
+        }
+
+        Ok(())
     }
 
     /// Find the leaf node that should contain a key.
@@ -442,5 +898,93 @@ mod tests {
         assert_eq!(tree.delete(&mut pool, 10).unwrap(), Some(100));
         assert_eq!(tree.search(&mut pool, 10).unwrap(), None);
         assert_eq!(tree.search(&mut pool, 20).unwrap(), Some(200));
+    }
+
+    #[test]
+    fn test_btree_many_inserts() {
+        let mut pool = create_pool();
+        let mut tree = BTree::new();
+
+        // Insert enough keys to trigger splits
+        for i in 0..500 {
+            tree.insert(&mut pool, i, (i * 10) as u64).unwrap();
+        }
+
+        // Verify all keys present
+        for i in 0..500 {
+            assert_eq!(tree.search(&mut pool, i).unwrap(), Some((i * 10) as u64));
+        }
+    }
+
+    #[test]
+    fn test_btree_many_deletes() {
+        let mut pool = create_pool();
+        let mut tree = BTree::new();
+
+        // Insert keys
+        for i in 0..100 {
+            tree.insert(&mut pool, i, (i * 10) as u64).unwrap();
+        }
+
+        // Delete half
+        for i in (0..100).step_by(2) {
+            assert_eq!(tree.delete(&mut pool, i).unwrap(), Some((i * 10) as u64));
+        }
+
+        // Verify remaining
+        for i in 0..100 {
+            if i % 2 == 0 {
+                assert_eq!(tree.search(&mut pool, i).unwrap(), None);
+            } else {
+                assert_eq!(tree.search(&mut pool, i).unwrap(), Some((i * 10) as u64));
+            }
+        }
+    }
+
+    #[test]
+    fn test_btree_delete_all() {
+        let mut pool = create_pool();
+        let mut tree = BTree::new();
+
+        // Insert and delete all
+        for i in 0..50 {
+            tree.insert(&mut pool, i, (i * 10) as u64).unwrap();
+        }
+
+        for i in 0..50 {
+            tree.delete(&mut pool, i).unwrap();
+        }
+
+        // Tree should be empty
+        for i in 0..50 {
+            assert_eq!(tree.search(&mut pool, i).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn test_btree_reverse_order_insert() {
+        let mut pool = create_pool();
+        let mut tree = BTree::new();
+
+        // Insert in reverse order
+        for i in (0..200).rev() {
+            tree.insert(&mut pool, i, (i * 10) as u64).unwrap();
+        }
+
+        // Verify all present
+        for i in 0..200 {
+            assert_eq!(tree.search(&mut pool, i).unwrap(), Some((i * 10) as u64));
+        }
+    }
+
+    #[test]
+    fn test_btree_duplicate_insert() {
+        let mut pool = create_pool();
+        let mut tree = BTree::new();
+
+        tree.insert(&mut pool, 10, 100).unwrap();
+        tree.insert(&mut pool, 10, 200).unwrap(); // Update
+
+        assert_eq!(tree.search(&mut pool, 10).unwrap(), Some(200));
     }
 }
