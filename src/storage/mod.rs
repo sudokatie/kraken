@@ -12,3 +12,4 @@ pub use page::{Page, PageId, PageType, PAGE_SIZE};
 pub use buffer_pool::BufferPool;
 pub use disk_manager::DiskManager;
 pub use btree::BTree;
+pub use heap::{HeapFile, RowId};

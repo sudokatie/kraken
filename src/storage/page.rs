@@ -146,9 +146,10 @@ impl Page {
     /// - [24..24+slot_count*4]: slot array
     /// - [free_space_end..PAGE_SIZE]: tuple data
     pub fn serialize(&self) -> [u8; PAGE_SIZE] {
-        let mut buf = [0u8; PAGE_SIZE];
+        // Start with entire raw data buffer (preserves metadata like HeapFile headers)
+        let mut buf = self.data;
 
-        // Header
+        // Overwrite with page header fields
         buf[0..4].copy_from_slice(&self.id.to_le_bytes());
         buf[4] = self.page_type as u8;
         buf[5..7].copy_from_slice(&self.free_space_start.to_le_bytes());
@@ -158,16 +159,12 @@ impl Page {
         buf[15..23].copy_from_slice(&self.lsn.to_le_bytes());
         // buf[23] reserved
 
-        // Slot array
+        // Overwrite slot array region
         for (i, slot) in self.slots.iter().enumerate() {
             let offset = PAGE_HEADER_SIZE + i * 4;
             buf[offset..offset + 2].copy_from_slice(&slot.offset.to_le_bytes());
             buf[offset + 2..offset + 4].copy_from_slice(&slot.length.to_le_bytes());
         }
-
-        // Tuple data (already in self.data at correct offsets)
-        let data_start = self.free_space_end as usize;
-        buf[data_start..PAGE_SIZE].copy_from_slice(&self.data[data_start..PAGE_SIZE]);
 
         buf
     }

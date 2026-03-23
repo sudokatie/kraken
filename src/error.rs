@@ -1,6 +1,7 @@
 //! Error types for Kraken.
 
 use thiserror::Error;
+use crate::sql::parser::ParseError;
 
 /// Result type for Kraken operations.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -10,6 +11,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Parse error: {0}")]
+    Parse(#[from] ParseError),
 
     #[error("Page not found: {0}")]
     PageNotFound(u32),

@@ -12,6 +12,9 @@ pub struct TableSchema {
     pub table_id: u32,
     /// Column definitions.
     pub columns: Vec<ColumnDef>,
+    /// Heap file header page ID (for storage).
+    #[serde(default)]
+    pub heap_page_id: Option<u32>,
 }
 
 impl TableSchema {
@@ -21,7 +24,14 @@ impl TableSchema {
             name: name.into(),
             table_id,
             columns,
+            heap_page_id: None,
         }
+    }
+    
+    /// Set the heap page ID.
+    pub fn with_heap_page_id(mut self, page_id: u32) -> Self {
+        self.heap_page_id = Some(page_id);
+        self
     }
 
     /// Get column by name.

@@ -2,6 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use std::io::{self, Write};
+use std::net::SocketAddr;
 
 use kraken::network::{Server, ServerConfig, Client, Response};
 
@@ -29,6 +30,10 @@ enum Commands {
         /// Node ID
         #[arg(long, default_value = "1")]
         node_id: u64,
+
+        /// Peer addresses (comma-separated, e.g., "node2:5432,node3:5432")
+        #[arg(long, value_delimiter = ',')]
+        peers: Vec<String>,
     },
 
     /// Connect to a database server
@@ -61,8 +66,8 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Server { data_dir, port, node_id } => {
-            run_server(data_dir, port, node_id).await;
+        Commands::Server { data_dir, port, node_id, peers } => {
+            run_server(data_dir, port, node_id, peers).await;
         }
         Commands::Client { host, port } => {
             run_client(host, port).await;
@@ -73,18 +78,36 @@ async fn main() {
     }
 }
 
-async fn run_server(data_dir: String, port: u16, node_id: u64) {
+async fn run_server(data_dir: String, port: u16, node_id: u64, peers: Vec<String>) {
     println!("Kraken v0.1.0");
     println!("Node ID: {}", node_id);
     println!("Data directory: {}", data_dir);
     println!("Listening on 0.0.0.0:{}", port);
 
-    // Create data directory
-    std::fs::create_dir_all(&data_dir).expect("failed to create data directory");
+    if !peers.is_empty() {
+        println!("Peers: {}", peers.join(", "));
+    }
+
+    // Create data directory (include node_id for multi-node on same machine)
+    let node_data_dir = format!("{}/node_{}", data_dir, node_id);
+    std::fs::create_dir_all(&node_data_dir).expect("failed to create data directory");
+
+    // Parse peer addresses
+    let peer_addrs: Vec<SocketAddr> = peers.iter()
+        .filter_map(|p| {
+            // Handle both "host:port" and just "host" (use default port)
+            if p.contains(':') {
+                p.parse().ok()
+            } else {
+                format!("{}:5432", p).parse().ok()
+            }
+        })
+        .collect();
 
     let config = ServerConfig {
         addr: format!("0.0.0.0:{}", port).parse().unwrap(),
         node_id,
+        peers: peer_addrs,
     };
 
     let server = Server::new(config);
@@ -145,6 +168,8 @@ async fn run_client(host: String, port: u16) {
                     println!("{} row(s)", result.rows.len());
                 } else if result.rows_affected > 0 {
                     println!("{} row(s) affected", result.rows_affected);
+                } else {
+                    println!("OK");
                 }
             }
             Ok(Response::Error(msg)) => {

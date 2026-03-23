@@ -120,6 +120,17 @@ impl Catalog {
         self.save()?;
         Ok(())
     }
+    
+    /// Update heap page ID for a table.
+    pub fn set_heap_page_id(&mut self, table_name: &str, page_id: u32) -> Result<()> {
+        if let Some(schema) = self.tables.get_mut(table_name) {
+            schema.heap_page_id = Some(page_id);
+            self.save()?;
+            Ok(())
+        } else {
+            Err(crate::Error::TableNotFound(table_name.to_string()))
+        }
+    }
 
     /// List all table names.
     pub fn list_tables(&self) -> Vec<&str> {

@@ -94,7 +94,20 @@ DELETE FROM users WHERE id = 1;
 
 ## Project Status
 
-v0.1.0 - In Development
+v0.1.0 - Complete
+
+## Benchmarks
+
+Run performance benchmarks to verify targets:
+
+```bash
+cargo bench
+```
+
+Performance targets (from spec):
+- Point lookups: < 1ms
+- Range scans: > 10K rows/sec
+- Write throughput: > 1K inserts/sec
 
 ## License
 
