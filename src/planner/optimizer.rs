@@ -2,21 +2,26 @@
 //!
 //! Converts logical plans to optimized physical plans.
 
-use super::logical::LogicalPlan;
+use super::logical::{LogicalPlan, JoinType};
 use super::physical::{PhysicalPlan, ColumnDef};
+use crate::catalog::{TableStatistics, StatisticsManager};
 use crate::sql::ast::Expr;
+use std::collections::HashMap;
 
 /// Query optimizer.
 pub struct Optimizer {
     /// Available indexes (table -> index names).
-    indexes: std::collections::HashMap<String, Vec<String>>,
+    indexes: HashMap<String, Vec<String>>,
+    /// Table statistics for cost estimation.
+    statistics: StatisticsManager,
 }
 
 impl Optimizer {
     /// Create a new optimizer.
     pub fn new() -> Self {
         Self {
-            indexes: std::collections::HashMap::new(),
+            indexes: HashMap::new(),
+            statistics: StatisticsManager::new(),
         }
     }
 
@@ -28,14 +33,161 @@ impl Optimizer {
             .push(index.to_string());
     }
 
+    /// Update statistics for a table.
+    pub fn update_statistics(&mut self, stats: TableStatistics) {
+        self.statistics.update(stats);
+    }
+
+    /// Get statistics manager.
+    pub fn statistics(&self) -> &StatisticsManager {
+        &self.statistics
+    }
+
     /// Optimize a logical plan into a physical plan.
     pub fn optimize(&self, plan: LogicalPlan) -> PhysicalPlan {
         // Apply optimization rules
         let plan = self.push_down_predicates(plan);
         let plan = self.eliminate_redundant_projects(plan);
+        let plan = self.reorder_joins(plan);
         
         // Convert to physical plan
         self.to_physical(plan)
+    }
+
+    /// Reorder joins based on estimated cardinalities.
+    fn reorder_joins(&self, plan: LogicalPlan) -> LogicalPlan {
+        match plan {
+            LogicalPlan::Join { left, right, condition, join_type } => {
+                // Recursively reorder children first
+                let left = self.reorder_joins(*left);
+                let right = self.reorder_joins(*right);
+
+                // Estimate sizes
+                let left_cost = self.estimate_plan_rows(&left);
+                let right_cost = self.estimate_plan_rows(&right);
+
+                // For inner joins, put smaller table on the left (build side for hash join)
+                if join_type == JoinType::Inner && right_cost < left_cost {
+                    // Swap left and right, adjusting condition if needed
+                    LogicalPlan::Join {
+                        left: Box::new(right),
+                        right: Box::new(left),
+                        condition: condition.map(|c| self.swap_join_condition(c)),
+                        join_type,
+                    }
+                } else {
+                    LogicalPlan::Join {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                        condition,
+                        join_type,
+                    }
+                }
+            }
+            // Recursively process other nodes
+            LogicalPlan::Filter { input, predicate } => {
+                LogicalPlan::Filter {
+                    input: Box::new(self.reorder_joins(*input)),
+                    predicate,
+                }
+            }
+            LogicalPlan::Project { input, columns } => {
+                LogicalPlan::Project {
+                    input: Box::new(self.reorder_joins(*input)),
+                    columns,
+                }
+            }
+            LogicalPlan::Sort { input, order_by } => {
+                LogicalPlan::Sort {
+                    input: Box::new(self.reorder_joins(*input)),
+                    order_by,
+                }
+            }
+            LogicalPlan::Limit { input, limit } => {
+                LogicalPlan::Limit {
+                    input: Box::new(self.reorder_joins(*input)),
+                    limit,
+                }
+            }
+            LogicalPlan::Aggregate { input, group_by, aggregates } => {
+                LogicalPlan::Aggregate {
+                    input: Box::new(self.reorder_joins(*input)),
+                    group_by,
+                    aggregates,
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// Estimate the number of rows a plan will produce.
+    fn estimate_plan_rows(&self, plan: &LogicalPlan) -> u64 {
+        match plan {
+            LogicalPlan::Scan { table, .. } => {
+                self.statistics.get(table)
+                    .map(|s| s.row_count)
+                    .unwrap_or(1000) // Default estimate
+            }
+            LogicalPlan::Filter { input, .. } => {
+                // Assume 33% selectivity
+                (self.estimate_plan_rows(input) as f64 * 0.33) as u64
+            }
+            LogicalPlan::Project { input, .. } => {
+                self.estimate_plan_rows(input)
+            }
+            LogicalPlan::Join { left, right, .. } => {
+                // Simplified: assume 10% of cross product
+                let left_rows = self.estimate_plan_rows(left);
+                let right_rows = self.estimate_plan_rows(right);
+                ((left_rows * right_rows) as f64 * 0.1) as u64
+            }
+            LogicalPlan::Aggregate { input, group_by, .. } => {
+                if group_by.is_empty() {
+                    1 // Single row for ungrouped aggregate
+                } else {
+                    // Assume 10% of input rows become groups
+                    (self.estimate_plan_rows(input) as f64 * 0.1).max(1.0) as u64
+                }
+            }
+            LogicalPlan::Sort { input, .. } => {
+                self.estimate_plan_rows(input)
+            }
+            LogicalPlan::Limit { limit, .. } => {
+                *limit as u64
+            }
+            _ => 1000, // Default for DML operations
+        }
+    }
+
+    /// Swap sides of a join condition (for reordering).
+    fn swap_join_condition(&self, expr: Expr) -> Expr {
+        match expr {
+            Expr::BinaryOp { left, op, right } => {
+                // Swap left and right for commutative operators
+                match op {
+                    crate::sql::ast::BinaryOp::Eq |
+                    crate::sql::ast::BinaryOp::And |
+                    crate::sql::ast::BinaryOp::Or => {
+                        Expr::BinaryOp { left: right, op, right: left }
+                    }
+                    // For non-commutative, need to flip the operator
+                    crate::sql::ast::BinaryOp::Lt => {
+                        Expr::BinaryOp { left: right, op: crate::sql::ast::BinaryOp::Gt, right: left }
+                    }
+                    crate::sql::ast::BinaryOp::Gt => {
+                        Expr::BinaryOp { left: right, op: crate::sql::ast::BinaryOp::Lt, right: left }
+                    }
+                    crate::sql::ast::BinaryOp::Le => {
+                        Expr::BinaryOp { left: right, op: crate::sql::ast::BinaryOp::Ge, right: left }
+                    }
+                    crate::sql::ast::BinaryOp::Ge => {
+                        Expr::BinaryOp { left: right, op: crate::sql::ast::BinaryOp::Le, right: left }
+                    }
+                    _ => Expr::BinaryOp { left, op, right }
+                }
+            }
+            other => other,
+        }
     }
 
     /// Push predicates down closer to table scans.
@@ -313,6 +465,15 @@ impl Default for Optimizer {
     }
 }
 
+/// Represents a join ordering decision.
+#[derive(Debug, Clone)]
+pub struct JoinOrder {
+    /// Tables in order.
+    pub tables: Vec<String>,
+    /// Estimated total cost.
+    pub estimated_cost: f64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,6 +596,101 @@ mod tests {
                 assert_eq!(aggregates.len(), 1);
             }
             _ => panic!("expected hash aggregate"),
+        }
+    }
+
+    #[test]
+    fn test_join_reorder_with_statistics() {
+        use crate::catalog::TableStatistics;
+
+        let mut opt = Optimizer::new();
+
+        // Small table: 100 rows
+        opt.update_statistics(TableStatistics::new("small_table").with_row_count(100));
+        // Large table: 10000 rows
+        opt.update_statistics(TableStatistics::new("large_table").with_row_count(10000));
+
+        // Create join with large table on left (suboptimal)
+        let plan = LogicalPlan::scan("large_table").join(
+            LogicalPlan::scan("small_table"),
+            Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column("id".into())),
+                op: BinaryOp::Eq,
+                right: Box::new(Expr::Column("ref_id".into())),
+            }),
+            JoinType::Inner,
+        );
+
+        let optimized = opt.reorder_joins(plan);
+
+        // After optimization, small table should be on the left
+        match optimized {
+            LogicalPlan::Join { left, right, .. } => {
+                match (*left, *right) {
+                    (LogicalPlan::Scan { table: left_table, .. },
+                     LogicalPlan::Scan { table: right_table, .. }) => {
+                        // Small table should now be on the left
+                        assert_eq!(left_table, "small_table");
+                        assert_eq!(right_table, "large_table");
+                    }
+                    _ => panic!("expected scans"),
+                }
+            }
+            _ => panic!("expected join"),
+        }
+    }
+
+    #[test]
+    fn test_estimate_plan_rows() {
+        use crate::catalog::TableStatistics;
+
+        let mut opt = Optimizer::new();
+        opt.update_statistics(TableStatistics::new("users").with_row_count(1000));
+
+        let plan = LogicalPlan::scan("users");
+        assert_eq!(opt.estimate_plan_rows(&plan), 1000);
+
+        // Filter reduces rows
+        let filtered = LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate: Expr::Literal(Literal::Boolean(true)),
+        };
+        let estimated = opt.estimate_plan_rows(&filtered);
+        assert!(estimated < 1000); // Should be ~330
+    }
+
+    #[test]
+    fn test_update_statistics() {
+        use crate::catalog::TableStatistics;
+
+        let mut opt = Optimizer::new();
+        opt.update_statistics(TableStatistics::new("test").with_row_count(500));
+
+        let stats = opt.statistics().get("test");
+        assert!(stats.is_some());
+        assert_eq!(stats.unwrap().row_count, 500);
+    }
+
+    #[test]
+    fn test_swap_join_condition() {
+        let opt = Optimizer::new();
+
+        let cond = Expr::BinaryOp {
+            left: Box::new(Expr::Column("a".into())),
+            op: BinaryOp::Lt,
+            right: Box::new(Expr::Column("b".into())),
+        };
+
+        let swapped = opt.swap_join_condition(cond);
+
+        // a < b should become b > a
+        match swapped {
+            Expr::BinaryOp { left, op, right } => {
+                assert!(matches!(op, BinaryOp::Gt));
+                assert!(matches!(*left, Expr::Column(ref c) if c == "b"));
+                assert!(matches!(*right, Expr::Column(ref c) if c == "a"));
+            }
+            _ => panic!("expected binary op"),
         }
     }
 }
