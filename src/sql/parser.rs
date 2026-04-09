@@ -644,6 +644,19 @@ impl Parser {
                 self.expect(Token::RParen)?;
                 Ok(expr)
             }
+            Token::Case => {
+                self.advance();
+                self.parse_case_expr()
+            }
+            Token::Exists => {
+                self.advance();
+                self.expect(Token::LParen)?;
+                self.expect(Token::Select)?;
+                // Parse the subquery (simplified - just parse a select)
+                let subquery = self.parse_select_inner()?;
+                self.expect(Token::RParen)?;
+                Ok(Expr::Exists { subquery: Box::new(subquery), negated: false })
+            }
             Token::Count | Token::Sum | Token::Avg | Token::Min | Token::Max => {
                 let name = match self.current() {
                     Token::Count => "COUNT",
@@ -687,6 +700,115 @@ impl Parser {
             }
             _ => Err(ParseError::new(format!("unexpected token in expression: {:?}", self.current()))),
         }
+    }
+
+    /// Parse CASE expression
+    fn parse_case_expr(&mut self) -> Result<Expr, ParseError> {
+        // Check if this is a simple CASE (with operand) or searched CASE
+        let operand = if !self.check(&Token::When) {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+
+        let mut when_clauses = vec![];
+        while self.check(&Token::When) {
+            self.advance();
+            let condition = self.parse_expr()?;
+            self.expect(Token::Then)?;
+            let result = self.parse_expr()?;
+            when_clauses.push(WhenClause { condition, result });
+        }
+
+        let else_result = if self.check(&Token::Else) {
+            self.advance();
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+
+        self.expect(Token::End)?;
+
+        Ok(Expr::Case { operand, when_clauses, else_result })
+    }
+
+    /// Parse inner select (for subqueries) - returns SelectStatement directly
+    fn parse_select_inner(&mut self) -> Result<SelectStatement, ParseError> {
+        // Parse columns
+        let columns = self.parse_select_columns()?;
+
+        // Parse FROM
+        self.expect(Token::From)?;
+        let from = self.parse_table_ref()?;
+
+        // Parse optional WHERE
+        let where_clause = if self.check(&Token::Where) {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        // Parse optional GROUP BY
+        let group_by = if self.check(&Token::GroupBy) {
+            self.advance();
+            if let Token::Ident(s) = self.current() {
+                if s.to_uppercase() == "BY" {
+                    self.advance();
+                }
+            }
+            self.parse_ident_list()?
+        } else {
+            vec![]
+        };
+
+        // Parse optional HAVING
+        let having = if self.check(&Token::Having) {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        // Parse optional ORDER BY
+        let order_by = if self.check(&Token::OrderBy) {
+            self.advance();
+            if let Token::Ident(s) = self.current() {
+                if s.to_uppercase() == "BY" {
+                    self.advance();
+                }
+            }
+            self.parse_order_by_list()?
+        } else {
+            vec![]
+        };
+
+        // Parse optional LIMIT
+        let limit = if self.check(&Token::Limit) {
+            self.advance();
+            match self.current() {
+                Token::IntLit(n) => {
+                    let n = *n;
+                    self.advance();
+                    Some(n)
+                }
+                _ => return Err(ParseError::new("expected integer after LIMIT")),
+            }
+        } else {
+            None
+        };
+
+        Ok(SelectStatement {
+            ctes: vec![],
+            columns,
+            from,
+            joins: vec![],
+            where_clause,
+            order_by,
+            limit,
+            group_by,
+            having,
+        })
     }
 }
 
@@ -849,6 +971,81 @@ mod tests {
         match stmt {
             Statement::Select(s) => {
                 assert_eq!(s.columns.len(), 2);
+            }
+            _ => panic!("expected SELECT"),
+        }
+    }
+
+    #[test]
+    fn test_parse_case_expression() {
+        let mut parser = Parser::new(
+            "SELECT CASE WHEN status = 1 THEN 'active' ELSE 'inactive' END FROM users"
+        ).unwrap();
+        let stmt = parser.parse().unwrap();
+
+        match stmt {
+            Statement::Select(s) => {
+                assert_eq!(s.columns.len(), 1);
+                match &s.columns[0] {
+                    SelectColumn::Expr { expr, .. } => {
+                        match expr {
+                            Expr::Case { operand, when_clauses, else_result } => {
+                                assert!(operand.is_none());
+                                assert_eq!(when_clauses.len(), 1);
+                                assert!(else_result.is_some());
+                            }
+                            _ => panic!("expected CASE expression"),
+                        }
+                    }
+                    _ => panic!("expected expression column"),
+                }
+            }
+            _ => panic!("expected SELECT"),
+        }
+    }
+
+    #[test]
+    fn test_parse_simple_case() {
+        let mut parser = Parser::new(
+            "SELECT CASE status WHEN 1 THEN 'a' WHEN 2 THEN 'b' END FROM users"
+        ).unwrap();
+        let stmt = parser.parse().unwrap();
+
+        match stmt {
+            Statement::Select(s) => {
+                match &s.columns[0] {
+                    SelectColumn::Expr { expr, .. } => {
+                        match expr {
+                            Expr::Case { operand, when_clauses, .. } => {
+                                assert!(operand.is_some());
+                                assert_eq!(when_clauses.len(), 2);
+                            }
+                            _ => panic!("expected CASE expression"),
+                        }
+                    }
+                    _ => panic!("expected expression column"),
+                }
+            }
+            _ => panic!("expected SELECT"),
+        }
+    }
+
+    #[test]
+    fn test_parse_exists_subquery() {
+        let mut parser = Parser::new(
+            "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.order_id = orders.id)"
+        ).unwrap();
+        let stmt = parser.parse().unwrap();
+
+        match stmt {
+            Statement::Select(s) => {
+                assert!(s.where_clause.is_some());
+                match s.where_clause.unwrap() {
+                    Expr::Exists { negated, .. } => {
+                        assert!(!negated);
+                    }
+                    _ => panic!("expected EXISTS expression"),
+                }
             }
             _ => panic!("expected SELECT"),
         }

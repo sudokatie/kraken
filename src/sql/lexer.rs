@@ -50,6 +50,17 @@ pub enum Token {
     Min,
     Max,
 
+    // CASE expression
+    Case,
+    When,
+    Then,
+    Else,
+    End,
+
+    // EXISTS/IN for subqueries
+    Exists,
+    In,
+
     // Identifiers and literals
     Ident(String),
     IntLit(i64),
@@ -193,6 +204,13 @@ impl<'a> Lexer<'a> {
             "AVG" => Token::Avg,
             "MIN" => Token::Min,
             "MAX" => Token::Max,
+            "CASE" => Token::Case,
+            "WHEN" => Token::When,
+            "THEN" => Token::Then,
+            "ELSE" => Token::Else,
+            "END" => Token::End,
+            "EXISTS" => Token::Exists,
+            "IN" => Token::In,
             "BY" => Token::Ident("BY".into()), // Part of ORDER BY / GROUP BY
             _ => Token::Ident(s),
         }
