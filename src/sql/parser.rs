@@ -166,8 +166,10 @@ impl Parser {
         };
 
         Ok(Statement::Select(SelectStatement {
+            ctes: vec![],
             columns,
             from,
+            joins: vec![],
             where_clause,
             order_by,
             limit,

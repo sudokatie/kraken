@@ -708,6 +708,50 @@ fn evaluate_expr(expr: &Expr, row: &Row, columns: &[String]) -> Value {
             let is_null = matches!(val, Value::Null);
             Value::Boolean(if *negated { !is_null } else { is_null })
         }
+        // Subqueries require context from executor - not supported in simple evaluation
+        Expr::Subquery(_) => {
+            // Would need to execute the subquery and return single value
+            Value::Null
+        }
+        Expr::Exists { .. } => {
+            // Would need to execute subquery and check if any rows returned
+            Value::Null
+        }
+        Expr::InSubquery { .. } => {
+            // Would need to execute subquery and check membership
+            Value::Null
+        }
+        Expr::Case { operand, when_clauses, else_result } => {
+            // Simple CASE evaluation
+            if let Some(op) = operand {
+                // Searched CASE: CASE operand WHEN val1 THEN result1 ...
+                let op_val = evaluate_expr(op, row, columns);
+                for when_clause in when_clauses {
+                    let when_val = evaluate_expr(&when_clause.condition, row, columns);
+                    if op_val == when_val {
+                        return evaluate_expr(&when_clause.result, row, columns);
+                    }
+                }
+            } else {
+                // Simple CASE: CASE WHEN condition THEN result ...
+                for when_clause in when_clauses {
+                    let cond_val = evaluate_expr(&when_clause.condition, row, columns);
+                    if cond_val == Value::Boolean(true) {
+                        return evaluate_expr(&when_clause.result, row, columns);
+                    }
+                }
+            }
+            // Return ELSE result or NULL
+            if let Some(else_expr) = else_result {
+                evaluate_expr(else_expr, row, columns)
+            } else {
+                Value::Null
+            }
+        }
+        Expr::WindowFunction { .. } => {
+            // Window functions require full result set context
+            Value::Null
+        }
     }
 }
 
