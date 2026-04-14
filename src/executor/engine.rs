@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use crate::sql::parser::Parser;
-use crate::sql::ast::{Statement, SelectStatement, InsertStatement, UpdateStatement, DeleteStatement, CreateTableStatement, Expr, Literal, BinaryOp, SelectColumn};
+use crate::sql::ast::{Statement, SelectStatement, InsertStatement, UpdateStatement, DeleteStatement, CreateTableStatement, Expr, Literal, BinaryOp, SelectColumn, WindowFunc, OrderBy};
 use crate::sql::types::Value;
 use crate::storage::{BufferPool, DiskManager, HeapFile};
 use crate::catalog::{Catalog, TableSchema};
@@ -803,6 +803,412 @@ fn evaluate_predicate(predicate: &Expr, row: &Row, columns: &[String]) -> bool {
     }
 }
 
+/// Context for evaluating expressions that may contain subqueries.
+pub struct ExprContext<'a> {
+    /// Function to execute a subquery and return results.
+    subquery_executor: Option<&'a dyn Fn(&SelectStatement) -> Result<Vec<Row>>>,
+}
+
+impl<'a> ExprContext<'a> {
+    /// Create a context with subquery support.
+    pub fn with_subquery_executor(
+        executor: &'a dyn Fn(&SelectStatement) -> Result<Vec<Row>>,
+    ) -> Self {
+        Self {
+            subquery_executor: Some(executor),
+        }
+    }
+
+    /// Create a context without subquery support.
+    pub fn empty() -> Self {
+        Self {
+            subquery_executor: None,
+        }
+    }
+}
+
+/// Evaluate expression with subquery support.
+fn evaluate_expr_with_context(
+    expr: &Expr,
+    row: &Row,
+    columns: &[String],
+    ctx: &ExprContext,
+) -> Value {
+    match expr {
+        // Scalar subquery: execute and return single value
+        Expr::Subquery(subquery) => {
+            if let Some(executor) = ctx.subquery_executor {
+                match executor(subquery) {
+                    Ok(rows) => {
+                        // Scalar subquery should return exactly one row with one column
+                        if let Some(first_row) = rows.first() {
+                            first_row.first().cloned().unwrap_or(Value::Null)
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    Err(_) => Value::Null,
+                }
+            } else {
+                Value::Null
+            }
+        }
+
+        // EXISTS: check if subquery returns any rows
+        Expr::Exists { subquery, negated } => {
+            if let Some(executor) = ctx.subquery_executor {
+                match executor(subquery) {
+                    Ok(rows) => {
+                        let exists = !rows.is_empty();
+                        Value::Boolean(if *negated { !exists } else { exists })
+                    }
+                    Err(_) => Value::Null,
+                }
+            } else {
+                Value::Null
+            }
+        }
+
+        // IN subquery: check if expression value is in subquery results
+        Expr::InSubquery { expr: check_expr, subquery, negated } => {
+            if let Some(executor) = ctx.subquery_executor {
+                let check_val = evaluate_expr_with_context(check_expr, row, columns, ctx);
+                match executor(subquery) {
+                    Ok(rows) => {
+                        // Check if value exists in first column of results
+                        let found = rows.iter().any(|r| {
+                            r.first().map(|v| v == &check_val).unwrap_or(false)
+                        });
+                        Value::Boolean(if *negated { !found } else { found })
+                    }
+                    Err(_) => Value::Null,
+                }
+            } else {
+                Value::Null
+            }
+        }
+
+        // Window functions are handled separately at result set level
+        Expr::WindowFunction { .. } => {
+            // Window functions need full result set - return placeholder
+            // Actual evaluation happens in apply_window_functions
+            Value::Null
+        }
+
+        // Delegate other expressions to standard evaluation with recursive context
+        Expr::BinaryOp { left, op, right } => {
+            let left_val = evaluate_expr_with_context(left, row, columns, ctx);
+            let right_val = evaluate_expr_with_context(right, row, columns, ctx);
+            evaluate_binary_op(&left_val, op, &right_val)
+        }
+
+        Expr::UnaryOp { op, expr: inner } => {
+            let val = evaluate_expr_with_context(inner, row, columns, ctx);
+            match op {
+                crate::sql::ast::UnaryOp::Not => match val {
+                    Value::Boolean(b) => Value::Boolean(!b),
+                    _ => Value::Null,
+                },
+                crate::sql::ast::UnaryOp::Neg => match val {
+                    Value::Integer(n) => Value::Integer(-n),
+                    Value::Real(n) => Value::Real(-n),
+                    _ => Value::Null,
+                },
+            }
+        }
+
+        Expr::IsNull { expr: inner, negated } => {
+            let val = evaluate_expr_with_context(inner, row, columns, ctx);
+            let is_null = matches!(val, Value::Null);
+            Value::Boolean(if *negated { !is_null } else { is_null })
+        }
+
+        Expr::Case { operand, when_clauses, else_result } => {
+            if let Some(op) = operand {
+                let op_val = evaluate_expr_with_context(op, row, columns, ctx);
+                for when_clause in when_clauses {
+                    let when_val = evaluate_expr_with_context(&when_clause.condition, row, columns, ctx);
+                    if op_val == when_val {
+                        return evaluate_expr_with_context(&when_clause.result, row, columns, ctx);
+                    }
+                }
+            } else {
+                for when_clause in when_clauses {
+                    let cond_val = evaluate_expr_with_context(&when_clause.condition, row, columns, ctx);
+                    if cond_val == Value::Boolean(true) {
+                        return evaluate_expr_with_context(&when_clause.result, row, columns, ctx);
+                    }
+                }
+            }
+            if let Some(else_expr) = else_result {
+                evaluate_expr_with_context(else_expr, row, columns, ctx)
+            } else {
+                Value::Null
+            }
+        }
+
+        // Other expressions use standard evaluation
+        _ => evaluate_expr(expr, row, columns),
+    }
+}
+
+/// Compute window functions over a result set.
+/// Returns rows with window function columns appended.
+pub fn compute_window_functions(
+    rows: Vec<Row>,
+    columns: &[String],
+    window_exprs: &[(Expr, String)], // (window expr, output alias)
+) -> Vec<Row> {
+    if window_exprs.is_empty() {
+        return rows;
+    }
+
+    let mut result_rows = rows.clone();
+
+    for (window_expr, _alias) in window_exprs {
+        if let Expr::WindowFunction { function, partition_by, order_by, .. } = window_expr {
+            // Group rows by partition
+            let partitions = partition_rows(&rows, partition_by, columns);
+
+            for (_partition_key, mut partition_indices) in partitions {
+                // Sort partition by ORDER BY
+                if !order_by.is_empty() {
+                    sort_partition(&rows, &mut partition_indices, order_by, columns);
+                }
+
+                // Compute window function for each row in partition
+                for (rank, &row_idx) in partition_indices.iter().enumerate() {
+                    let value = compute_window_value(
+                        function,
+                        &rows,
+                        &partition_indices,
+                        rank,
+                        columns,
+                    );
+                    result_rows[row_idx].push(value);
+                }
+            }
+        }
+    }
+
+    result_rows
+}
+
+/// Partition rows by partition expressions.
+/// Returns a map from partition key (as string) to row indices.
+fn partition_rows(
+    rows: &[Row],
+    partition_by: &[Expr],
+    columns: &[String],
+) -> HashMap<String, Vec<usize>> {
+    let mut partitions: HashMap<String, Vec<usize>> = HashMap::new();
+
+    for (idx, row) in rows.iter().enumerate() {
+        let key = if partition_by.is_empty() {
+            // No partition by = single partition containing all rows
+            String::new()
+        } else {
+            // Create string key from partition values
+            partition_by
+                .iter()
+                .map(|expr| value_to_partition_key(&evaluate_expr(expr, row, columns)))
+                .collect::<Vec<_>>()
+                .join("|")
+        };
+        partitions.entry(key).or_default().push(idx);
+    }
+
+    partitions
+}
+
+/// Convert a Value to a string for partition key purposes.
+fn value_to_partition_key(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Integer(n) => format!("I:{}", n),
+        Value::Real(n) => format!("R:{}", n),
+        Value::Text(s) => format!("T:{}", s),
+        Value::Boolean(b) => format!("B:{}", b),
+        Value::Blob(b) => format!("X:{}", hex_encode(b)),
+    }
+}
+
+/// Simple hex encoding for blob values.
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Sort partition indices by ORDER BY columns.
+fn sort_partition(
+    rows: &[Row],
+    indices: &mut [usize],
+    order_by: &[OrderBy],
+    columns: &[String],
+) {
+    indices.sort_by(|&a, &b| {
+        for order in order_by {
+            if let Some(col_idx) = columns.iter().position(|c| c == &order.column) {
+                let va = rows[a].get(col_idx).cloned().unwrap_or(Value::Null);
+                let vb = rows[b].get(col_idx).cloned().unwrap_or(Value::Null);
+                let cmp = compare_values(&va, &vb);
+                if cmp != std::cmp::Ordering::Equal {
+                    return if order.descending { cmp.reverse() } else { cmp };
+                }
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
+/// Compute value for a single window function at a specific position.
+fn compute_window_value(
+    function: &WindowFunc,
+    rows: &[Row],
+    partition_indices: &[usize],
+    position: usize,
+    columns: &[String],
+) -> Value {
+    let partition_size = partition_indices.len();
+
+    match function {
+        WindowFunc::RowNumber => Value::Integer((position + 1) as i64),
+
+        WindowFunc::Rank => {
+            // Rank is position + 1 (simplified - doesn't handle ties)
+            Value::Integer((position + 1) as i64)
+        }
+
+        WindowFunc::DenseRank => {
+            // Dense rank (simplified - doesn't handle ties)
+            Value::Integer((position + 1) as i64)
+        }
+
+        WindowFunc::NTile(n) => {
+            let bucket = (position * (*n as usize)) / partition_size;
+            Value::Integer((bucket + 1).min(*n as usize) as i64)
+        }
+
+        WindowFunc::Lead { expr, offset, default } => {
+            let off = offset.unwrap_or(1) as usize;
+            if position + off < partition_size {
+                let target_idx = partition_indices[position + off];
+                evaluate_expr(expr, &rows[target_idx], columns)
+            } else {
+                default.as_ref()
+                    .map(|d| evaluate_expr(d, &rows[partition_indices[position]], columns))
+                    .unwrap_or(Value::Null)
+            }
+        }
+
+        WindowFunc::Lag { expr, offset, default } => {
+            let off = offset.unwrap_or(1) as usize;
+            if position >= off {
+                let target_idx = partition_indices[position - off];
+                evaluate_expr(expr, &rows[target_idx], columns)
+            } else {
+                default.as_ref()
+                    .map(|d| evaluate_expr(d, &rows[partition_indices[position]], columns))
+                    .unwrap_or(Value::Null)
+            }
+        }
+
+        WindowFunc::FirstValue(expr) => {
+            let first_idx = partition_indices[0];
+            evaluate_expr(expr, &rows[first_idx], columns)
+        }
+
+        WindowFunc::LastValue(expr) => {
+            let last_idx = partition_indices[partition_size - 1];
+            evaluate_expr(expr, &rows[last_idx], columns)
+        }
+
+        WindowFunc::NthValue { expr, n } => {
+            let idx = (*n - 1) as usize;
+            if idx < partition_size {
+                let target_idx = partition_indices[idx];
+                evaluate_expr(expr, &rows[target_idx], columns)
+            } else {
+                Value::Null
+            }
+        }
+
+        WindowFunc::Aggregate { name, args } => {
+            // Compute aggregate over entire partition
+            let partition_rows: Vec<&Row> = partition_indices
+                .iter()
+                .map(|&i| &rows[i])
+                .collect();
+
+            match name.to_uppercase().as_str() {
+                "COUNT" => Value::Integer(partition_rows.len() as i64),
+                "SUM" => {
+                    if let Some(arg) = args.first() {
+                        let sum: f64 = partition_rows
+                            .iter()
+                            .filter_map(|row| {
+                                match evaluate_expr(arg, row, columns) {
+                                    Value::Integer(n) => Some(n as f64),
+                                    Value::Real(n) => Some(n),
+                                    _ => None,
+                                }
+                            })
+                            .sum();
+                        Value::Real(sum)
+                    } else {
+                        Value::Null
+                    }
+                }
+                "AVG" => {
+                    if let Some(arg) = args.first() {
+                        let values: Vec<f64> = partition_rows
+                            .iter()
+                            .filter_map(|row| {
+                                match evaluate_expr(arg, row, columns) {
+                                    Value::Integer(n) => Some(n as f64),
+                                    Value::Real(n) => Some(n),
+                                    _ => None,
+                                }
+                            })
+                            .collect();
+                        if values.is_empty() {
+                            Value::Null
+                        } else {
+                            Value::Real(values.iter().sum::<f64>() / values.len() as f64)
+                        }
+                    } else {
+                        Value::Null
+                    }
+                }
+                "MIN" => {
+                    if let Some(arg) = args.first() {
+                        partition_rows
+                            .iter()
+                            .map(|row| evaluate_expr(arg, row, columns))
+                            .filter(|v| !matches!(v, Value::Null))
+                            .min_by(|a, b| compare_values(a, b))
+                            .unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    }
+                }
+                "MAX" => {
+                    if let Some(arg) = args.first() {
+                        partition_rows
+                            .iter()
+                            .map(|row| evaluate_expr(arg, row, columns))
+                            .filter(|v| !matches!(v, Value::Null))
+                            .max_by(|a, b| compare_values(a, b))
+                            .unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    }
+                }
+                _ => Value::Null,
+            }
+        }
+    }
+}
+
 fn compare_values(left: &Value, right: &Value) -> std::cmp::Ordering {
     match (left, right) {
         (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
@@ -1033,5 +1439,444 @@ mod tests {
         let restored = deserialize_row(&data).unwrap();
         
         assert_eq!(restored, row);
+    }
+
+    // Subquery and Window Function Tests
+
+    #[test]
+    fn test_expr_context_scalar_subquery() {
+        // Test scalar subquery evaluation
+        let rows = vec![
+            vec![Value::Integer(100)],
+            vec![Value::Integer(200)],
+        ];
+
+        let subquery_executor = |_stmt: &SelectStatement| -> Result<Vec<Row>> {
+            Ok(rows.clone())
+        };
+
+        let ctx = ExprContext::with_subquery_executor(&subquery_executor);
+
+        // Create a subquery expression
+        let subquery = SelectStatement {
+            ctes: vec![],
+            columns: vec![SelectColumn::Star],
+            from: crate::sql::ast::TableRef { name: "dummy".into(), alias: None },
+            joins: vec![],
+            where_clause: None,
+            order_by: vec![],
+            limit: None,
+            group_by: vec![],
+            having: None,
+        };
+
+        let expr = Expr::Subquery(Box::new(subquery));
+        let result = evaluate_expr_with_context(&expr, &vec![], &[], &ctx);
+
+        // Should return first row, first column
+        assert_eq!(result, Value::Integer(100));
+    }
+
+    #[test]
+    fn test_expr_context_exists_true() {
+        // Test EXISTS returns true when rows exist
+        let rows = vec![vec![Value::Integer(1)]];
+
+        let subquery_executor = |_stmt: &SelectStatement| -> Result<Vec<Row>> {
+            Ok(rows.clone())
+        };
+
+        let ctx = ExprContext::with_subquery_executor(&subquery_executor);
+
+        let subquery = SelectStatement {
+            ctes: vec![],
+            columns: vec![SelectColumn::Star],
+            from: crate::sql::ast::TableRef { name: "dummy".into(), alias: None },
+            joins: vec![],
+            where_clause: None,
+            order_by: vec![],
+            limit: None,
+            group_by: vec![],
+            having: None,
+        };
+
+        let expr = Expr::Exists {
+            subquery: Box::new(subquery),
+            negated: false,
+        };
+        let result = evaluate_expr_with_context(&expr, &vec![], &[], &ctx);
+        assert_eq!(result, Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_expr_context_exists_false() {
+        // Test EXISTS returns false when no rows
+        let subquery_executor = |_stmt: &SelectStatement| -> Result<Vec<Row>> {
+            Ok(vec![])
+        };
+
+        let ctx = ExprContext::with_subquery_executor(&subquery_executor);
+
+        let subquery = SelectStatement {
+            ctes: vec![],
+            columns: vec![SelectColumn::Star],
+            from: crate::sql::ast::TableRef { name: "dummy".into(), alias: None },
+            joins: vec![],
+            where_clause: None,
+            order_by: vec![],
+            limit: None,
+            group_by: vec![],
+            having: None,
+        };
+
+        let expr = Expr::Exists {
+            subquery: Box::new(subquery),
+            negated: false,
+        };
+        let result = evaluate_expr_with_context(&expr, &vec![], &[], &ctx);
+        assert_eq!(result, Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_expr_context_not_exists() {
+        // Test NOT EXISTS returns true when no rows
+        let subquery_executor = |_stmt: &SelectStatement| -> Result<Vec<Row>> {
+            Ok(vec![])
+        };
+
+        let ctx = ExprContext::with_subquery_executor(&subquery_executor);
+
+        let subquery = SelectStatement {
+            ctes: vec![],
+            columns: vec![SelectColumn::Star],
+            from: crate::sql::ast::TableRef { name: "dummy".into(), alias: None },
+            joins: vec![],
+            where_clause: None,
+            order_by: vec![],
+            limit: None,
+            group_by: vec![],
+            having: None,
+        };
+
+        let expr = Expr::Exists {
+            subquery: Box::new(subquery),
+            negated: true,
+        };
+        let result = evaluate_expr_with_context(&expr, &vec![], &[], &ctx);
+        assert_eq!(result, Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_expr_context_in_subquery_found() {
+        // Test IN subquery when value is found
+        let rows = vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)],
+        ];
+
+        let subquery_executor = |_stmt: &SelectStatement| -> Result<Vec<Row>> {
+            Ok(rows.clone())
+        };
+
+        let ctx = ExprContext::with_subquery_executor(&subquery_executor);
+
+        let subquery = SelectStatement {
+            ctes: vec![],
+            columns: vec![SelectColumn::Star],
+            from: crate::sql::ast::TableRef { name: "dummy".into(), alias: None },
+            joins: vec![],
+            where_clause: None,
+            order_by: vec![],
+            limit: None,
+            group_by: vec![],
+            having: None,
+        };
+
+        let expr = Expr::InSubquery {
+            expr: Box::new(Expr::Literal(Literal::Integer(2))),
+            subquery: Box::new(subquery),
+            negated: false,
+        };
+        let result = evaluate_expr_with_context(&expr, &vec![], &[], &ctx);
+        assert_eq!(result, Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_expr_context_in_subquery_not_found() {
+        // Test IN subquery when value is not found
+        let rows = vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+        ];
+
+        let subquery_executor = |_stmt: &SelectStatement| -> Result<Vec<Row>> {
+            Ok(rows.clone())
+        };
+
+        let ctx = ExprContext::with_subquery_executor(&subquery_executor);
+
+        let subquery = SelectStatement {
+            ctes: vec![],
+            columns: vec![SelectColumn::Star],
+            from: crate::sql::ast::TableRef { name: "dummy".into(), alias: None },
+            joins: vec![],
+            where_clause: None,
+            order_by: vec![],
+            limit: None,
+            group_by: vec![],
+            having: None,
+        };
+
+        let expr = Expr::InSubquery {
+            expr: Box::new(Expr::Literal(Literal::Integer(99))),
+            subquery: Box::new(subquery),
+            negated: false,
+        };
+        let result = evaluate_expr_with_context(&expr, &vec![], &[], &ctx);
+        assert_eq!(result, Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_expr_context_not_in_subquery() {
+        // Test NOT IN subquery
+        let rows = vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+        ];
+
+        let subquery_executor = |_stmt: &SelectStatement| -> Result<Vec<Row>> {
+            Ok(rows.clone())
+        };
+
+        let ctx = ExprContext::with_subquery_executor(&subquery_executor);
+
+        let subquery = SelectStatement {
+            ctes: vec![],
+            columns: vec![SelectColumn::Star],
+            from: crate::sql::ast::TableRef { name: "dummy".into(), alias: None },
+            joins: vec![],
+            where_clause: None,
+            order_by: vec![],
+            limit: None,
+            group_by: vec![],
+            having: None,
+        };
+
+        let expr = Expr::InSubquery {
+            expr: Box::new(Expr::Literal(Literal::Integer(99))),
+            subquery: Box::new(subquery),
+            negated: true,
+        };
+        let result = evaluate_expr_with_context(&expr, &vec![], &[], &ctx);
+        assert_eq!(result, Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_window_row_number() {
+        let rows = vec![
+            vec![Value::Text("a".into()), Value::Integer(10)],
+            vec![Value::Text("a".into()), Value::Integer(20)],
+            vec![Value::Text("a".into()), Value::Integer(30)],
+        ];
+        let columns = vec!["dept".to_string(), "salary".to_string()];
+
+        let window_expr = Expr::WindowFunction {
+            function: WindowFunc::RowNumber,
+            partition_by: vec![],
+            order_by: vec![OrderBy { column: "salary".into(), descending: false }],
+            frame: None,
+        };
+
+        let result = compute_window_functions(rows, &columns, &[(window_expr, "rn".into())]);
+
+        assert_eq!(result.len(), 3);
+        // Row numbers should be assigned based on order
+        assert_eq!(result[0][2], Value::Integer(1));
+        assert_eq!(result[1][2], Value::Integer(2));
+        assert_eq!(result[2][2], Value::Integer(3));
+    }
+
+    #[test]
+    fn test_window_row_number_partitioned() {
+        let rows = vec![
+            vec![Value::Text("a".into()), Value::Integer(10)],
+            vec![Value::Text("b".into()), Value::Integer(20)],
+            vec![Value::Text("a".into()), Value::Integer(30)],
+            vec![Value::Text("b".into()), Value::Integer(40)],
+        ];
+        let columns = vec!["dept".to_string(), "salary".to_string()];
+
+        let window_expr = Expr::WindowFunction {
+            function: WindowFunc::RowNumber,
+            partition_by: vec![Expr::Column("dept".into())],
+            order_by: vec![OrderBy { column: "salary".into(), descending: false }],
+            frame: None,
+        };
+
+        let result = compute_window_functions(rows, &columns, &[(window_expr, "rn".into())]);
+
+        // Each partition should have its own row numbers
+        assert_eq!(result.len(), 4);
+        // Partition 'a': rows 0 and 2 -> should be 1, 2
+        // Partition 'b': rows 1 and 3 -> should be 1, 2
+    }
+
+    #[test]
+    fn test_window_lead() {
+        let rows = vec![
+            vec![Value::Integer(1), Value::Integer(100)],
+            vec![Value::Integer(2), Value::Integer(200)],
+            vec![Value::Integer(3), Value::Integer(300)],
+        ];
+        let columns = vec!["id".to_string(), "value".to_string()];
+
+        let window_expr = Expr::WindowFunction {
+            function: WindowFunc::Lead {
+                expr: Box::new(Expr::Column("value".into())),
+                offset: Some(1),
+                default: Some(Box::new(Expr::Literal(Literal::Integer(-1)))),
+            },
+            partition_by: vec![],
+            order_by: vec![OrderBy { column: "id".into(), descending: false }],
+            frame: None,
+        };
+
+        let result = compute_window_functions(rows, &columns, &[(window_expr, "next_val".into())]);
+
+        assert_eq!(result[0][2], Value::Integer(200)); // lead from 100 -> 200
+        assert_eq!(result[1][2], Value::Integer(300)); // lead from 200 -> 300
+        assert_eq!(result[2][2], Value::Integer(-1));  // lead from 300 -> default
+    }
+
+    #[test]
+    fn test_window_lag() {
+        let rows = vec![
+            vec![Value::Integer(1), Value::Integer(100)],
+            vec![Value::Integer(2), Value::Integer(200)],
+            vec![Value::Integer(3), Value::Integer(300)],
+        ];
+        let columns = vec!["id".to_string(), "value".to_string()];
+
+        let window_expr = Expr::WindowFunction {
+            function: WindowFunc::Lag {
+                expr: Box::new(Expr::Column("value".into())),
+                offset: Some(1),
+                default: Some(Box::new(Expr::Literal(Literal::Integer(0)))),
+            },
+            partition_by: vec![],
+            order_by: vec![OrderBy { column: "id".into(), descending: false }],
+            frame: None,
+        };
+
+        let result = compute_window_functions(rows, &columns, &[(window_expr, "prev_val".into())]);
+
+        assert_eq!(result[0][2], Value::Integer(0));   // lag from 100 -> default
+        assert_eq!(result[1][2], Value::Integer(100)); // lag from 200 -> 100
+        assert_eq!(result[2][2], Value::Integer(200)); // lag from 300 -> 200
+    }
+
+    #[test]
+    fn test_window_first_last_value() {
+        let rows = vec![
+            vec![Value::Integer(1), Value::Integer(100)],
+            vec![Value::Integer(2), Value::Integer(200)],
+            vec![Value::Integer(3), Value::Integer(300)],
+        ];
+        let columns = vec!["id".to_string(), "value".to_string()];
+
+        let first_expr = Expr::WindowFunction {
+            function: WindowFunc::FirstValue(Box::new(Expr::Column("value".into()))),
+            partition_by: vec![],
+            order_by: vec![OrderBy { column: "id".into(), descending: false }],
+            frame: None,
+        };
+
+        let last_expr = Expr::WindowFunction {
+            function: WindowFunc::LastValue(Box::new(Expr::Column("value".into()))),
+            partition_by: vec![],
+            order_by: vec![OrderBy { column: "id".into(), descending: false }],
+            frame: None,
+        };
+
+        let result = compute_window_functions(
+            rows,
+            &columns,
+            &[(first_expr, "first".into()), (last_expr, "last".into())],
+        );
+
+        // All rows should have same first value (100)
+        assert_eq!(result[0][2], Value::Integer(100));
+        assert_eq!(result[1][2], Value::Integer(100));
+        assert_eq!(result[2][2], Value::Integer(100));
+
+        // All rows should have same last value (300)
+        assert_eq!(result[0][3], Value::Integer(300));
+        assert_eq!(result[1][3], Value::Integer(300));
+        assert_eq!(result[2][3], Value::Integer(300));
+    }
+
+    #[test]
+    fn test_window_aggregate_sum() {
+        let rows = vec![
+            vec![Value::Text("a".into()), Value::Integer(10)],
+            vec![Value::Text("a".into()), Value::Integer(20)],
+            vec![Value::Text("b".into()), Value::Integer(100)],
+        ];
+        let columns = vec!["dept".to_string(), "salary".to_string()];
+
+        let window_expr = Expr::WindowFunction {
+            function: WindowFunc::Aggregate {
+                name: "SUM".into(),
+                args: vec![Expr::Column("salary".into())],
+            },
+            partition_by: vec![Expr::Column("dept".into())],
+            order_by: vec![],
+            frame: None,
+        };
+
+        let result = compute_window_functions(rows, &columns, &[(window_expr, "total".into())]);
+
+        // Dept 'a' total = 30
+        assert_eq!(result[0][2], Value::Real(30.0));
+        assert_eq!(result[1][2], Value::Real(30.0));
+        // Dept 'b' total = 100
+        assert_eq!(result[2][2], Value::Real(100.0));
+    }
+
+    #[test]
+    fn test_window_ntile() {
+        let rows = vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)],
+            vec![Value::Integer(4)],
+        ];
+        let columns = vec!["id".to_string()];
+
+        let window_expr = Expr::WindowFunction {
+            function: WindowFunc::NTile(2),
+            partition_by: vec![],
+            order_by: vec![OrderBy { column: "id".into(), descending: false }],
+            frame: None,
+        };
+
+        let result = compute_window_functions(rows, &columns, &[(window_expr, "bucket".into())]);
+
+        // 4 rows into 2 buckets: [1,2] -> bucket 1, [3,4] -> bucket 2
+        assert_eq!(result[0][1], Value::Integer(1));
+        assert_eq!(result[1][1], Value::Integer(1));
+        assert_eq!(result[2][1], Value::Integer(2));
+        assert_eq!(result[3][1], Value::Integer(2));
+    }
+
+    #[test]
+    fn test_partition_key_encoding() {
+        // Test various value types in partition keys
+        assert_eq!(value_to_partition_key(&Value::Null), "NULL");
+        assert_eq!(value_to_partition_key(&Value::Integer(42)), "I:42");
+        assert_eq!(value_to_partition_key(&Value::Real(3.14)), "R:3.14");
+        assert_eq!(value_to_partition_key(&Value::Text("hello".into())), "T:hello");
+        assert_eq!(value_to_partition_key(&Value::Boolean(true)), "B:true");
     }
 }
